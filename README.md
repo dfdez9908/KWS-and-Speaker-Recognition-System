@@ -7,3 +7,4 @@ The data set folder contains the samples used for training the Speaker Recogniti
 
 The Model folder contains the models in .keras format.
 
+The App folder contains the Android project.
