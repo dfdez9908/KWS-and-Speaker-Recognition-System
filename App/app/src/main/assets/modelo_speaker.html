@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Locutor</title>
+  <style>
+body {
+  font-family: Arial, sans-serif;
+  text-align: center;
+  margin: 0;
+  padding: 7px 2vw 0 2vw;
+  background: #fff;
+  min-width: 0;
+  min-height: 0;
+  width: 100vw;
+  box-sizing: border-box;
+  overflow-x: hidden;
+}
+h2 {
+  color: #2d3a4a;
+  margin-top: 5px;
+  margin-bottom: 10px;
+  font-size: 1.2rem;
+  background: #e8f0ffbb;
+  border-radius: 7px;
+  padding: 2px 13px;
+  max-width: 96vw;
+  display: inline-block;
+}
+#status { font-weight: bold; margin-top: 8px; color: #1a4648; }
+#result { margin-top: 16px; font-size: 1.1rem; color: #18466b; word-break: break-word; max-width: 98vw;}
+@media (max-width: 600px) {
+  h2 { font-size: 1.01rem; padding: 2px 4vw; }
+  #status, #result { font-size: 1rem; }
+}
+  </style>
+</head>
+<body>
+  <h2>Locutor</h2>
+  <div id="status">Status: Aguardando áudio</div>
+  <div id="result"></div>
+  <script src="edge-impulse-standalone-speaker.js?v=2"></script>
+  <script src="run-impulse-speaker.js?v=2"></script>
+  <script>
+    
+    class FFT {
+      constructor(size) {
+        this.size = size;
+        this._csize = size << 1;
+      }
+      createComplexArray() {
+        return new Float32Array(this._csize);
+      }
+      realTransform(out, data) {
+        const N = this.size;
+        for (let i = 0; i < 2 * N; i++) out[i] = 0;
+        for (let i = 0; i < N; i++) out[2 * i] = data[i];
+        function reverseBits(x, bits) {
+          let y = 0;
+          for (let i = 0; i < bits; i++) {
+            y = (y << 1) | (x & 1);
+            x = x >> 1;
+          }
+          return y;
+        }
+        let bits = Math.log2(N);
+        for (let i = 0; i < N; i++) {
+          let j = reverseBits(i, bits);
+          if (j > i) {
+            let xr = out[2 * i], xi = out[2 * i + 1];
+            out[2 * i] = out[2 * j];
+            out[2 * i + 1] = out[2 * j + 1];
+            out[2 * j] = xr;
+            out[2 * j + 1] = xi;
+          }
+        }
+        for (let len = 2; len <= N; len <<= 1) {
+          let ang = -2 * Math.PI / len;
+          let wlenR = Math.cos(ang), wlenI = Math.sin(ang);
+          for (let i = 0; i < N; i += len) {
+            let wr = 1, wi = 0;
+            for (let j = 0; j < len / 2; j++) {
+              let uR = out[2 * (i + j)], uI = out[2 * (i + j) + 1];
+              let vR = out[2 * (i + j + len / 2)], vI = out[2 * (i + j + len / 2) + 1];
+              let tR = wr * vR - wi * vI;
+              let tI = wr * vI + wi * vR;
+              out[2 * (i + j)] = uR + tR;
+              out[2 * (i + j) + 1] = uI + tI;
+              out[2 * (i + j + len / 2)] = uR - tR;
+              out[2 * (i + j + len / 2) + 1] = uI - tI;
+              let nwr = wr * wlenR - wi * wlenI;
+              let nwi = wr * wlenI + wi * wlenR;
+              wr = nwr; wi = nwi;
+            }
+          }
+        }
+      }
+    }
+
+    
+    function zeros2D(rows, cols) {
+      let arr = [];
+      for (let i = 0; i < rows; i++) arr.push(new Array(cols).fill(0));
+      return arr;
+    }
+    function hamming(N) {
+      let win = [];
+      for (let n = 0; n < N; n++)
+        win.push(0.54 - 0.46 * Math.cos((2 * Math.PI * n) / (N - 1)));
+      return win;
+    }
+    function mean(arr) {
+      let m = 0;
+      for (let i = 0; i < arr.length; i++) m += arr[i];
+      return m / arr.length;
+    }
+    function std(arr) {
+      const m = mean(arr);
+      return Math.sqrt(arr.map(x => (x - m) ** 2).reduce((a, b) => a + b, 0) / arr.length);
+    }
+    function dctOrtho(n, m) {
+      let dct = zeros2D(n, m);
+      for (let k = 0; k < m; k++) {
+        for (let i = 0; i < n; i++) {
+          let norm = Math.sqrt(2 / n);
+          if (k === 0) norm = Math.sqrt(1 / n);
+          dct[i][k] = norm * Math.cos(Math.PI * (i + 0.5) * k / n);
+        }
+      }
+      return dct;
+    }
+    function melFilterbank(numFilters, fftPoints, sampleRate, lowFreq, highFreq) {
+      function hz2mel(hz) { return 2595 * Math.log10(1 + hz / 700); }
+      function mel2hz(mel) { return 700 * (10 ** (mel / 2595) - 1); }
+      let lowMel = hz2mel(lowFreq), highMel = hz2mel(highFreq);
+      let melPoints = [];
+      for (let i = 0; i < numFilters + 2; i++)
+        melPoints.push(lowMel + (highMel - lowMel) * i / (numFilters + 1));
+      let hzPoints = melPoints.map(mel2hz);
+      let bins = hzPoints.map(hz => Math.floor((fftPoints + 1) * hz / sampleRate));
+      let fbanks = zeros2D(numFilters, Math.floor(fftPoints / 2) + 1);
+      for (let i = 1; i <= numFilters; i++) {
+        let left = bins[i - 1], center = bins[i], right = bins[i + 1];
+        for (let k = left; k < center; k++)
+          if (center - left !== 0 && k >= 0 && k < fbanks[0].length) fbanks[i - 1][k] = (k - left) / (center - left);
+        for (let k = center; k < right; k++)
+          if (right - center !== 0 && k >= 0 && k < fbanks[0].length) fbanks[i - 1][k] = (right - k) / (right - center);
+      }
+      return fbanks;
+    }
+    function cmvnw(mfcc, win_size) {
+      const rows = mfcc.length, cols = mfcc[0].length;
+      const pad = Math.floor((win_size - 1) / 2);
+      let vec_pad = [];
+      for (let i = pad - 1; i >= 0; i--) vec_pad.push([...mfcc[0]]);
+      for (let i = 0; i < rows; i++) vec_pad.push([...mfcc[i]]);
+      for (let i = rows - win_size + 1; i < rows; i++) vec_pad.push([...mfcc[rows-1]]);
+      let output = zeros2D(rows, cols);
+      for (let i = 0; i < rows; i++) {
+        let window = vec_pad.slice(i, i + win_size);
+        for (let j = 0; j < cols; j++) {
+          let colVals = window.map(row => row[j]);
+          let m = mean(colVals), s = std(colVals) + 1e-10;
+          output[i][j] = (mfcc[i][j] - m) / s;
+        }
+      }
+      return output;
+    }
+
+    
+    async function compute_mfcc_js(audio, sample_rate = 16000, frame_size = 0.032, frame_stride = 0.032, num_filters = 40, fft_points = 512, num_cepstral = 13, alpha = 0.98) {
+      let emphasized = new Float32Array(audio.length);
+      emphasized[0] = audio[0];
+      for (let i = 1; i < audio.length; i++)
+        emphasized[i] = audio[i] - alpha * audio[i - 1];
+      let frameLength = Math.round(frame_size * sample_rate); // 512
+      let frameStep = Math.round(frame_stride * sample_rate); // 512
+      let numFrames = Math.floor((emphasized.length - frameLength) / frameStep) + 1;
+      let frames = [];
+      let win = hamming(frameLength);
+      for (let i = 0; i < numFrames; i++) {
+        let start = i * frameStep;
+        let frame = emphasized.slice(start, start + frameLength);
+        if (frame.length < frameLength) continue;
+        for (let j = 0; j < frame.length; j++)
+          frame[j] *= win[j];
+        frames.push(frame);
+      }
+      if (frames.length === 0) {
+        return Array(403).fill(0);
+      }
+      let pow_frames = [];
+      let fftObj = new FFT(fft_points);
+      for (let frame of frames) {
+        let X = new Float32Array(fft_points);
+        for (let i = 0; i < frame.length; i++) X[i] = frame[i];
+        let out = fftObj.createComplexArray();
+        fftObj.realTransform(out, X);
+        let spectrum = Array(fft_points / 2 + 1).fill(0);
+        for (let k = 0; k < fft_points / 2 + 1; k++) {
+          let real = out[2 * k], imag = out[2 * k + 1];
+          let mag = Math.sqrt(real * real + imag * imag);
+          spectrum[k] = (1.0 / fft_points) * (mag * mag);
+        }
+        pow_frames.push(spectrum);
+      }
+      let fbanks = melFilterbank(num_filters, fft_points, sample_rate, 0, sample_rate / 2);
+      let log_mel = [];
+      for (let i = 0; i < pow_frames.length; i++) {
+        let mel = [];
+        for (let m = 0; m < num_filters; m++) {
+          let s = 0;
+          for (let k = 0; k < pow_frames[i].length; k++)
+            s += pow_frames[i][k] * fbanks[m][k];
+          mel.push(s === 0 ? 1e-10 : s);
+        }
+        log_mel.push(mel.map(v => 10 * Math.log10(v)));
+      }
+      let dct_matrix = dctOrtho(num_filters, num_cepstral);
+      let mfcc = [];
+      for (let i = 0; i < log_mel.length; i++) {
+        let cepstral = [];
+        for (let k = 0; k < num_cepstral; k++) {
+          let val = 0;
+          for (let m = 0; m < num_filters; m++)
+            val += log_mel[i][m] * dct_matrix[m][k];
+          if (!isFinite(val)) val = 0;
+          cepstral.push(val);
+        }
+        if (cepstral.length !== num_cepstral) cepstral = new Array(num_cepstral).fill(0);
+        mfcc.push(cepstral);
+      }
+      while (mfcc.length < 31) mfcc.push(new Array(num_cepstral).fill(0));
+      mfcc = mfcc.map(row => (row && row.length === num_cepstral) ? row : new Array(num_cepstral).fill(0));
+      let mfcc_cmvn = cmvnw(mfcc, 101);
+      let features = mfcc_cmvn.flat();
+      if (features.length > 403) features = features.slice(0, 403);
+      if (features.length < 403) features = features.concat(Array(403 - features.length).fill(0));
+      return features;
+    }
+
+    
+    let classifier, isModelInitialized = false;
+    const statusDiv = document.getElementById('status');
+    const resultDiv = document.getElementById('result');
+    const TARGET_SAMPLE_RATE = 16000;
+    const EXPECTED_SAMPLES = 16000;
+    const EXPECTED_FEATURES = 403;
+    let cleanTimeout = null;
+
+    async function initModel() {
+      statusDiv.textContent = 'Status: Inicializando modelo...';
+      try {
+        classifier = new EdgeImpulseClassifier2();
+        await classifier.init();
+        isModelInitialized = true;
+        statusDiv.textContent = 'Status: Pronto para classificação';
+        console.log('[Speaker] Modelo speaker carregado.');
+      } catch (err) {
+        console.error('Erro ao carregar o modelo:', err);
+        statusDiv.textContent = `Erro ao carregar o modelo: ${err.message}`;
+      }
+    }
+    initModel();
+
+    async function classifyFromArray(audioArray) {
+      if (!isModelInitialized) {
+        resultDiv.textContent = 'Modelo ainda não carregado.';
+        console.error('[Speaker] Modelo ainda não carregado.');
+        return;
+      }
+      if (!audioArray || audioArray.length !== EXPECTED_SAMPLES) {
+        resultDiv.textContent = `Áudio inválido recebido! Esperado: ${EXPECTED_SAMPLES}, recebido: ${audioArray ? audioArray.length : 'null'}`;
+        console.error('[Speaker] Áudio inválido:', audioArray);
+        return;
+      }
+      statusDiv.textContent = 'Status: Extraindo MFCC...';
+      try {
+        const mfccFeatures = await compute_mfcc_js(audioArray, 16000, 0.032, 0.032, 40, 512, 13, 0.98);
+
+        
+        console.log("[Speaker] MFCC calculados y enviados al modelo:", mfccFeatures);
+
+        if (!mfccFeatures || mfccFeatures.length !== EXPECTED_FEATURES) {
+          resultDiv.textContent = `MFCC inválido! Esperado: ${EXPECTED_FEATURES}, recebido: ${mfccFeatures ? mfccFeatures.length : 'null'}`;
+          console.error('[Speaker] MFCC inválido:', mfccFeatures);
+          return;
+        }
+        statusDiv.textContent = 'Status: Classificando...';
+
+        
+        const result = classifier.classify(mfccFeatures);
+        const results = result.results || result.classifications || [];
+        
+        const topSpeaker = results.reduce((max, curr) => max.value > curr.value ? max : curr, results[0]);
+
+        
+        let etiqueta = topSpeaker.label;
+        if (etiqueta === "0" || etiqueta === "class 1" || etiqueta === "Class 1" || etiqueta === "Diana") etiqueta = "Diana";
+        else if (etiqueta === "1" || etiqueta === "class 2" || etiqueta === "Class 2" || etiqueta === "Outros") etiqueta = "Outros";
+        
+
+        
+        resultDiv.innerHTML = `<b>Locutor:</b> ${etiqueta} (${(topSpeaker.value*100).toFixed(1)}%)`;
+
+        
+        window.parent.postMessage({
+          modelo: 'speaker',
+          label: etiqueta,
+          value: topSpeaker.value
+        }, '*');
+        statusDiv.textContent = 'Status: Pronto para próxima classificação';
+        clearTimeout(cleanTimeout);
+        cleanTimeout = setTimeout(() => {
+          resultDiv.textContent = '';
+        }, 2000);
+      } catch (err) {
+        resultDiv.textContent = `Erro: ${err.message}`;
+        statusDiv.textContent = 'Status: Erro na classificação';
+        console.error('[Speaker] Erro na classificação:', err);
+        clearTimeout(cleanTimeout);
+        cleanTimeout = setTimeout(() => {
+          resultDiv.textContent = '';
+        }, 2000);
+      }
+    }
+
+    window.addEventListener("message", (event) => {
+      if (event.data.action === "classifyAudio" && Array.isArray(event.data.audioArray)) {
+        classifyFromArray(event.data.audioArray);
+      }
+    });
+  </script>
+</body>
+</html>
